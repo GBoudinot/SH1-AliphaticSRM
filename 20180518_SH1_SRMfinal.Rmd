@@ -1,0 +1,1234 @@
+---
+title: "20180518_SH1_all"
+output: 
+  html_document:
+    df: paged
+    toc: true
+    toc_float: true
+---
+
+# Start up functions
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r "load libraries", echo = FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(stringr)
+library(knitr)
+library(readxl)
+library(tidyr)
+library(purrr)
+library(xlsx)
+library(gridExtra)
+source(file.path("libs", "functions.r"))
+opts_chunk$set(dev=c("png", "pdf"), dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path = file.path("plots", "smoky_hollows_SRM")) ### CHANGE PLOT SUFFIX ###
+```
+
+# Read and organize data
+```{r}
+read_srm_export <- function(filename, columns = c("peak_name", "RT.min", "basepeak", "area.cpm", "height.cts", "quantitation")) {
+  filename %>% 
+    # read excel files
+    read_excel(sheet = "Integration", skip = 42, 
+               col_names = columns, col_types = rep("text", length(columns))) %>% 
+    as_data_frame() %>%
+    # remove empty rows
+    filter(!is.na(peak_name), peak_name != "n.a.") %>% 
+    # convert the relevant numeric columns into numbers
+    mutate_at(vars(RT.min, area.cpm, height.cts), as.numeric) %>% 
+    # remove useless columns
+    select(-basepeak, -quantitation) %>% 
+    # add filename info
+    mutate(file_id = gsub("\\.xls", "", basename(filename))) %>% 
+    select(file_id, everything())
+}
+
+# get data
+all_data <- 
+  # find all excel files ##change name and use new folder for new project
+  list.files( "data_SH1", recursive = TRUE, full.names = TRUE, pattern = "\\.xls$") %>% 
+  # send them to the read method
+  lapply(read_srm_export) %>% 
+  # combine the data set
+  bind_rows() %>% 
+  # pull out sample information
+  #mutate(sample_id = str_match(all_data$file_id, "TSQ\\d+_GB_(.*)$") %>% { .[,2] }) %>% 
+  # get n replicates
+  group_by(file_id)
+  #mutate(n_replicates = length(unique(file_id)))
+
+```
+
+
+# Calculation peak amounts and rock concentrations, ID standards
+```{r}
+depth_and_rock_info <- read_excel(file.path("metadata", "aliphaticSRM_SH1.xlsx")) %>% 
+  rename(tle = `TLE.mg`, maltene = `maltenes.mg`, ref_amount_added.ug = `D4.ug` )%>% 
+  filter(!is.na(file_id)) %>%
+  filter (process == "yes")
+depth_and_rock_info
+```
+
+```{r}
+data_by_depth <- 
+  all_data %>%
+  left_join(depth_and_rock_info, by = "file_id") %>% 
+  group_by(file_id) %>% 
+  mutate(
+    n_peaks = n(),
+    n_standards = sum(peak_name == "D4 C29 ISTD"),
+    ref_area.cpm = area.cpm[peak_name == "D4 C29 ISTD"],
+    amount.ug = area.cpm/ref_area.cpm * ref_amount_added.ug,
+   
+    #Normalize by what you want
+    conc_rock.ug_g = amount.ug / rock.g, 
+    conc_tle.ug.g = amount.ug / tle,  
+    conc_maltene.ug.g = amount.ug / maltene
+    
+  )%>% ungroup() %>% 
+  arrange(file_id, peak_name) 
+
+data_by_depth
+```
+
+# Calculate Recovery
+
+## Linear regressions of the calibration curves
+```{r}
+standard <- read_excel(file.path("metadata", "D4_calibration.xlsx"))   ###read excel
+
+###calibration curve
+standard %>% 
+  ggplot() +
+  aes(x = Known.ng, y = Measured_area.counts, color = calibration) + 
+  geom_smooth(method = "lm", alpha = 0.5) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none") 
+ 
+calibrations <- 
+  standard %>% 
+  filter(!is.na(calibration)) %>% 
+  nest(-calibration) %>% 
+  mutate(
+    fit = map(data, ~summary(lm(`Measured_area.counts`~ `Known.ng`, data = .x))),
+    coefficients = map(fit, "coefficients"),
+    intercept = map_dbl(coefficients, `[`, 1, 1),
+    intercept_se = map_dbl(coefficients, `[`, 1, 2),
+    slope = map_dbl(coefficients, `[`, 2, 1),
+    slope_se = map_dbl(coefficients, `[`, 2, 2),
+    r2 = map_dbl(fit, "r.squared")
+  )
+
+calibrations %>% select(-data, -fit, -coefficients) %>% knitr::kable(d = 3)
+```
+
+## Determine yield
+
+These numbers are not useful for anything else.
+```{r}
+calib_data <-
+  data_by_depth %>% 
+  # temp
+  mutate(calibration = "jan2018") %>% 
+  left_join(calibrations, by = "calibration") %>% 
+  mutate(
+    total_volume.uL = 100,
+    total_inject.uL = 1.5,
+    ref_amount_inject_expected.ng = (ref_amount_added.ug * 1000)/total_volume.uL * total_inject.uL ,
+    ref_amount_inject_measured.ng = (ref_area.cpm - intercept)/slope,
+    ref_amount_measured.ug = ((total_volume.uL* ref_amount_inject_measured.ng)/total_inject.uL) * 1/1000,
+    yield = (ref_amount_inject_measured.ng/ref_amount_inject_expected.ng) * 100
+  )
+  
+calib_data
+```
+
+
+# Ratios
+## Functions for ratios and sums
+```{r}
+sum_peaks <- function(df, filter_condition, new_peak_name) {
+  filter_condition <- sprintf("(%s)", str_c(filter_condition, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_condition)) %>% 
+    summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      conc_rock.ug_g = sum(conc_rock.ug_g)
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+
+ratio_peaks <- function(df, filter_top, filter_bottom, new_peak_name) {
+  filter_top <- sprintf("(%s)", str_c(filter_top, collapse = "|"))
+  filter_bottom <- sprintf("(%s)", str_c(filter_bottom, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_top) | str_detect(peak_name, filter_bottom)) %>% 
+    summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      ratio = sum(conc_rock.ug_g[str_detect(peak_name, filter_top)]) / sum(conc_rock.ug_g[str_detect(peak_name, filter_bottom)])
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+```
+
+## Combine compounds, calculate ratios 
+```{r}
+#set values to use for later calculations
+final_data1 <- calib_data %>% 
+    group_by(file_id) %>% 
+        do({
+          bind_rows(., 
+              #C27_Dia/Reg
+                sum_peaks(.,  c("C27 aB 20R ST", "C27 aB 20S ST"), "C27Dia"),      
+                sum_peaks(., c("C27 aaa 20R ST", "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST", "C27 Ba 20R ST", "C27 Ba 20S ST"), "C27Reg"),
+            
+              #Total Tricyclics
+                sum_peaks(., c("C19 Tri HO", "C20 Tri HO", "C21 Tri HO", "C22 Tri HO", "C23 Tri HO", "C24 Tet HO", "C24 Tri HO", "C25 Tri R+S HO", "C26 Tri R HO", "C26 Tri S HO"), "all_tricyclics"),
+            
+              #4Me_TriMe
+                sum_peaks(., c("4B Me 5a cholestane", "4B Me 24 ethyl 5a cholestane", "4B,23S,24S trimethyl 5a cholestane", "4B,23S,24R trimethyl 5a cholestane", "4B,23R,24S trimethyl 5a cholestane", "4B,23R,24R trimethyl 5a cholestane", "4a Me 5a cholestane", "4a Me 24 ethyl 5a cholestane", "4a,23S,24S trimethyl 5a cholestane", "4a,23S,24R trimethyl 5a cholestane", "4a,23R,24S trimethyl 5a cholestane", "4a,23R,24R trimethyl 5a cholestane"), "4Me_TriMe"),
+            
+              #allRegSt
+                sum_peaks(., c("C26 aBB 20S ST", "C26 aBB 20R ST", "C26 aaa 20S ST", "C26 aaa 20R ST","C27 aBB 20S ST", "C27 aBB 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST", "C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST","C29 aBB 20S ST", "C29 aBB 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aBB 20 R+S ST", "C30 aaa 20S ST", "C30 aaa 20R ST"), "allRegst"),
+              #C26St
+                sum_peaks(., c("C26 aBB 20S ST", "C26 aBB 20R ST", "C26 aaa 20S ST", "C26 aaa 20R ST"), "C26Regst"),
+              
+              #C27St
+                sum_peaks(., c("C27 aBB 20S ST", "C27 aBB 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST"), "C27Regst"),
+              
+              #C28St
+                sum_peaks(., c("C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST"), "C28Regst"),
+              
+              #C29St
+                sum_peaks(., c("C29 aBB 20S ST", "C29 aBB 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST"), "C29Regst"),
+              
+              #C30St
+                sum_peaks(., c("C30 aBB 20 R+S ST", "C30 aaa 20S ST", "C30 aaa 20R ST"), "C30Regst"),
+            
+              #allRegHO
+                sum_peaks(., c("Ts C27 HO", "Tm C27 HO", "C27 17B H Ho", "29, 30 C28H bisnor HO", "28, 30 C28 bisnor HO", "C29 Ts HO", "C29 Ba HO", "C29 BB Ho", "C30 aB HO", "C30 BB HO", "C30H Ba HO", "C31 HR Ba HO", "C31 aB HR HO", "C31 aB HS HO", "C31 BB HO", "C32 aB HS HO", "C32 aB HR HO", "C33 aB HS HO", "C33 aB HR HO", "C34 aB HR HO", "C34 aB HS HO", "C35 aB HR HO", "C35 aB HS HO"), "allRegHO") ,
+              
+              #allDiacholestane
+              sum_peaks(., c("20S, 4a Me 13B,17a,H diacholestane", "20R, 4a Me 13B,17a,H diacholestane" , "20R, 4a Me 13a,17B,H diacholestane", "20S, 4a,24 dimethyl 13B,17a,H diacholestane", "20R 4a,24 dimethyl 13B,17a,H diacholestane", "20R, 4a,24 dimethyl 13a,17B,H diacholestane" , "20S, 4a,24 dimethyl 13a,17B,H diacholestane", "4a,24 dimethyl 5a cholestane" , "4B,24 dimethyl 5a cholestane"), "allDiacholestane"), 
+              
+              #all Steranes
+              sum_peaks(., c("C26 Ba 20S ST", "C26 Ba 20R ST", "C26 aBB 20S ST", "C26 aBB 20R ST", "C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20R ST", "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST", "C27 Ba 20R ST", "C27 Ba 20S ST", "C28 Ba 20S ST", "C28 Ba 20R ST", "C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST" , "C29 Ba 20S ST", "C29 Ba 20R ST", "C29 aBB 20S ST", "C29 aBB 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST" , "C30 Ba 20S ST", "C30 Ba 20R ST", "C30 aBB 20(R+S) ST", "C30 aaa 20S ST", "C30 aaa 20R ST", "C30 4a Me 20S ST", "C30 4a Me 20R ST + DINO st", "C30 3B Me BB 20S ST", "C30 3B Me 20S ST + C30 3B Me BB 20R ST" , "C30 3BMe 20R ST", "C30 2aMe 20S ST", "C30 2a Me 20R + 4a Me BB 20S ST" , "4B Me 5a cholestane", "4B Me 24 ethyl 5a cholestane", "4B,23S,24S trimethyl 5a cholestane", "4B,23S,24R trimethyl 5a cholestane", "4B,23R,24S trimethyl 5a cholestane", "4B,23R,24R trimethyl 5a cholestane", "4a Me 5a cholestane", "4a Me 24 ethyl 5a cholestane", "4a,23S,24S trimethyl 5a cholestane", "4a,23S,24R trimethyl 5a cholestane", "4a,23R,24S trimethyl 5a cholestane", "4a,23R,24R trimethyl 5a cholestane", "20S, 4a Me 13B,17a,H diacholestane", "20R, 4a Me 13B,17a,H diacholestane" , "20R, 4a Me 13a,17B,H diacholestane", "20S, 4a,24 dimethyl 13B,17a,H diacholestane", "20R 4a,24 dimethyl 13B,17a,H diacholestane", "20R, 4a,24 dimethyl 13a,17B,H diacholestane" , "20S, 4a,24 dimethyl 13a,17B,H diacholestane", "4a,24 dimethyl 5a cholestane" , "4B,24 dimethyl 5a cholestane"), "allSteranes"),
+              
+              #everything
+              sum_peaks(., c(""), "everything"),
+              
+              #2 Me Hopanes
+              sum_peaks(., c("C31 2a Me Ho", "C32 2aMe R HO", "C32 2aMe S HO", "C33 2aMe S HO", "C33 2aMe R HO", "C34 2a Me S HO", "C34 2a Me R HO", "C36 2a Me R HO", "C36 2a Me S HO"), "2MeHo_all"),
+              
+              #3 Me Hopanes
+              sum_peaks(., c("C31 3B Me HO", "C32 3B Me S HO", "C32 3B Me R HO", "C32 3B Me Ba 22S+R ST", "C33 3BMe S HO", "C33 3BMe R HO", "C34 3B Me S Ho", "C34 3B Me R HO", "C35 3B Me R HO", "C35 3B Me S HO", "C36 3B Me S HO", "C36 3B Me R HO"), "3MeHo_all")
+            
+) }) %>% ungroup()
+
+```
+
+            
+```{r}
+final_data <- final_data1 %>% 
+    group_by(file_id) %>% 
+        do({
+          bind_rows(., 
+           #Source
+              #C19/tricyclics
+                ratio_peaks(., "C19 Tri HO", "all_tricyclics", "C19/tricyclics"),
+              #C20/tricyclics
+                ratio_peaks(., "C20 Tri HO", "all_tricyclics", "C20/tricyclics"),
+              #C21/tricyclics
+                ratio_peaks(., "C21 Tri HO", "all_tricyclics", "C21/tricyclics"),
+              #C22/tricyclics
+                ratio_peaks(., "C22 Tri HO", "all_tricyclics", "C22/tricyclics"),
+              #C23/tricyclics
+                ratio_peaks(., "C23 Tri HO", "all_tricyclics", "C23/tricyclics"),
+              #C24/tricyclics
+                ratio_peaks(., c("C24 Tet HO", "C24 Tri HO"), "all_tricyclics", "C24/tricyclics"),
+              #C24TET/tricyclics
+                ratio_peaks(., "C24 Tet HO", "all_tricyclics", "C24tet/tricyclics"),
+              #C25/tricyclics
+                ratio_peaks(., "C25 Tri R+S HO", "all_tricyclics", "C25/tricyclics"),
+              #C26/tricyclics
+                ratio_peaks(., c("C26 Tri R HO", "C26 Tri S HO"), "all_tricyclics", "C26/tricyclics"),
+              #tricyclics/all
+                ratio_peaks(., "all_tricyclics", c(""), "tricyclics/all"),
+              #C19/C19+23
+                ratio_peaks(., "C19 Tri HO", c("C19 Tri HO", "C23 Tri HO"), "C19/C19+23"),
+              #C20/C20+23
+                ratio_peaks(., "C20 Tri HO", c("C20 Tri HO", "C23 Tri HO"), "C20/C20+23"),
+           
+              #Ho/St
+                ratio_peaks(., "allRegHO", c("C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aaa 20S ST", "C30 aaa 20R ST"), "Ho/St"),
+              #Ho/St%
+                ratio_peaks(., "allRegHO", c("C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aaa 20S ST", "C30 aaa 20R ST", "allRegHO" ), "Ho/St%"),
+            
+              #C31_2MHI
+                ratio_peaks(., "C31 2a Me Ho", c("C30 aB HO", "C31 2a Me Ho" ), "C31_2MHI"),
+              #C31_35_2MHI
+                ratio_peaks(., c("C31 2a Me Ho", "C32 2aMe R HO", "C32 2aMe S HO", "C33 2aMe S HO", "C33 2aMe R HO", "C34 2a Me S HO", "C34 2a Me R HO", "C36 2a Me R HO", "C36 2a Me S HO"), c("C30 aB HO", "C31 2a Me Ho", "C32 2aMe R HO", "C32 2aMe S HO", "C33 2aMe S HO", "C33 2aMe R HO", "C34 2a Me S HO", "C34 2a Me R HO", "C36 2a Me R HO", "C36 2a Me S HO"), "C31_35_2MHI"),
+              #C31_2-MHI/C27-C30Steranes
+                ratio_peaks(., "C31 2a Me Ho", c("C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST" ,"C28 aaa 20S ST", "C28 aaa 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aaa 20S ST", "C30 aaa 20R ST", "C31 2a Me Ho" ), "C31_2-MHI/C27-C30Steranes"),
+              #C31 3-MHI 
+                ratio_peaks(., "C31 3B Me HO", c("C31 3B Me HO", "C30 aB HO"), "C31 3-MHI"), 
+              #C31_35_3MHI(%)
+                 ratio_peaks(., c("C31 3B Me HO", "C32 3B Me S HO", "C32 3B Me R HO", "C32 3B Me Ba 22S+R ST", "C33 3BMe S HO", "C33 3BMe R HO", "C34 3B Me S Ho", "C34 3B Me R HO", "C35 3B Me R HO", "C35 3B Me S HO", "C36 3B Me S HO", "C36 3B Me R HO"), c("C30 aB HO","C31 3B Me HO", "C32 3B Me S HO", "C32 3B Me R HO", "C32 3B Me Ba 22S+R ST", "C33 3BMe S HO", "C33 3BMe R HO", "C34 3B Me S HO", "C34 3B Me R HO", "C35 3B Me R HO", "C35 3B Me S HO", "C36 3B Me S HO", "C36 3B Me R HO" ) ,"C31_35_3MHI(%)"),
+
+              #C29ab/C29ab+C30ab
+                 ratio_peaks(., "C29 aB HO", c( "C29 aB HO" , "C30 aB HO"), "C29ab/C29ab+C30ab"), 
+              #C29ab/allHoab
+                 ratio_peaks(., "C29 aB HO" , c("C35 aB HS HO", "C35 aB HR HO", "C34 aB HS HO", "C34 aB HR HO", "C33 aB HS HO" , "C33 aB HR HO", "C32 aB HR HO", "C32 aB HS HO", "C31 aB HS HO", "C31 aB HR HO", "C30 aB HO", "C29 aB HO"), "C29ab/allHoab"), 
+              #C30ab/allHoab 
+                 ratio_peaks(., "C30 aB HO" , c("C35 aB HS HO", "C35 aB HR HO", "C34 aB HS HO", "C34 aB HR HO", "C33 aB HS HO" , "C33 aB HR HO", "C32 aB HR HO", "C32 aB HS HO", "C31 aB HS HO", "C31 aB HR HO", "C30 aB HO", "C29 aB HO"), "C30ab/allHoab"), 
+              #C31ab/allHoab 
+                 ratio_peaks(., c("C31 aB HS HO", "C31 aB HR HO") , c("C35 aB HS HO", "C35 aB HR HO", "C34 aB HS HO", "C34 aB HR HO", "C33 aB HS HO" , "C33 aB HR HO", "C32 aB HR HO", "C32 aB HS HO", "C31 aB HS HO", "C31 aB HR HO", "C30 aB HO", "C29 aB HO"), "C31ab/allHoab"),
+              #C32ab/allHoab 
+                 ratio_peaks(., c("C32 aB HR HO", "C32 aB HS HO") , c("C35 aB HS HO", "C35 aB HR HO", "C34 aB HS HO", "C34 aB HR HO", "C33 aB HS HO" , "C33 aB HR HO", "C32 aB HR HO", "C32 aB HS HO", "C31 aB HS HO", "C31 aB HR HO", "C30 aB HO", "C29 aB HO"), "C32ab/allHoab"),
+              #C33ab/allHoab 
+                 ratio_peaks(., c( "C33 aB HS HO" , "C33 aB HR HO") , c("C35 aB HS HO", "C35 aB HR HO", "C34 aB HS HO", "C34 aB HR HO", "C33 aB HS HO" , "C33 aB HR HO", "C32 aB HR HO", "C32 aB HS HO", "C31 aB HS HO", "C31 aB HR HO", "C30 aB HO", "C29 aB HO"), "C33ab/allHoab"),
+              #C34ab/allHoab 
+                 ratio_peaks(., c( "C34 aB HS HO", "C34 aB HR HO") , c("C35 aB HS HO", "C35 aB HR HO", "C34 aB HS HO", "C34 aB HR HO", "C33 aB HS HO" , "C33 aB HR HO", "C32 aB HR HO", "C32 aB HS HO", "C31 aB HS HO", "C31 aB HR HO", "C30 aB HO", "C29 aB HO"), "C34ab/allHoab"),
+              #C35ab/allHoab 
+                 ratio_peaks(., c("C35 aB HS HO", "C35 aB HR HO") , c("C35 aB HS HO", "C35 aB HR HO", "C34 aB HS HO", "C34 aB HR HO", "C33 aB HS HO" , "C33 aB HR HO", "C32 aB HR HO", "C32 aB HS HO", "C31 aB HS HO", "C31 aB HR HO", "C30 aB HO", "C29 aB HO"), "C35ab/allHoab"),
+              #OleananeIndex
+                ratio_peaks(., "Oleanane HO", c("Oleanane HO", "C30 aB HO"), "OleananeIndex"),
+
+              #HHI
+                ratio_peaks(., c("C35 aB HS HO", "C35 aB HR HO") , c("C35 aB HS HO", "C35 aB HR HO", "C34 aB HS HO", "C34 aB HR HO", "C33 aB HS HO" , "C33 aB HR HO", "C32 aB HR HO", "C32 aB HS HO", "C31 aB HS HO", "C31 aB HR HO"), "HHI"),
+              #C35/C35+C34
+                ratio_peaks(., c("C35 aB HS HO", "C35 aB HR HO"), c("C34 aB HS HO", "C34 aB HR HO","C35 aB HS HO", "C35 aB HR HO"), "C35/C35+C34"),
+              #GI
+                ratio_peaks(., "gamma", c("gamma", "C30 aB HO"), "GI"),
+              #28,30BNH/28,30BNH+C30
+                ratio_peaks(., "28, 30 C28 bisnor HO", c("28, 30 C28 bisnor HO", "C30 aB HO"), "28,30BNH/28,30BNH+C30") ,
+           
+           #Source
+              #C26St/allSt ##INCLUDES ME's
+                ratio_peaks(., c("C26 Ba 20S ST", "C26 Ba 20R ST", "C26 aBB 20S ST", "C26 aBB 20R ST", "C26 aaa 20S ST", "C26 aaa 20R ST"), "allSteranes", "C26St/allSt"), 
+              #C27St/allSt
+                ratio_peaks(., c("C27 aaa 20R ST", "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST", "C27 Ba 20R ST", "C27 Ba 20S ST"), "allSteranes", "C27St/allSt"),
+              #C28St/allSt
+                ratio_peaks(., c("C28 Ba 20S ST", "C28 Ba 20R ST", "C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST"), "allSteranes", "C28St/allSt"),
+              #C29St/allSt
+                ratio_peaks(., c("C29 Ba 20S ST", "C29 Ba 20R ST", "C29 aBB 20S ST", "C29 aBB 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST"), "allSteranes", "C29St/allSt"),
+              #C30St/allSt (does not include Me's in numerator)
+                ratio_peaks(., c("C30 Ba 20S ST", "C30 Ba 20R ST", "C30 aBB 20(R+S) ST", "C30 aaa 20S ST", "C30 aaa 20R ST"), "allSteranes", "C30St/allSt"),
+              #C30Me/allSt (C30 Me's in numerator)(not in MRM spreadsheet)
+                ratio_peaks(., c("C30 4a Me 20S ST", "C30 4a Me 20R ST + DINO st", "C30 3B Me BB 20S ST",  "C30 3B Me 20S ST + C30 3B Me BB 20R ST", "C30 3BMe 20R ST", "C30 2aMe 20S ST", "C30 2a Me 20R + 4a Me BB 20S ST"), "allSteranes", "C30Me/allSt"),
+              #DinoSt/allSt
+                ratio_peaks(., c("4B Me 5a cholestane", "4B Me 24 ethyl 5a cholestane", "4B,23S,24S trimethyl 5a cholestane", "4B,23S,24R trimethyl 5a cholestane", "4B,23R,24S trimethyl 5a cholestane", "4B,23R,24R trimethyl 5a cholestane", "4a Me 5a cholestane", "4a Me 24 ethyl 5a cholestane", "4a,23S,24S trimethyl 5a cholestane", "4a,23S,24R trimethyl 5a cholestane", "4a,23R,24S trimethyl 5a cholestane", "4a,23R,24R trimethyl 5a cholestane"), "allSteranes", "DinoSt/allSt"),
+           
+              #C26/(C26-30)aaaSR
+                ratio_peaks(., c("C26 aaa 20R ST", "C26 aaa 20S ST"), c("aaa 20R ST", "aaa 20S ST") , "C26/(C26-30)aaaSR"),
+              #C27/(C26-30)aaaSR
+                ratio_peaks(., c("C27 aaa 20R ST", "C27 aaa 20S ST"), c("aaa 20R ST", "aaa 20S ST") , "C27/(C26-30)aaaSR"),
+              #C28/(C26-30)aaaSR
+                ratio_peaks(., c("C28 aaa 20R ST", "C28 aaa 20S ST"), c("aaa 20R ST", "aaa 20S ST") , "C28/(C26-30)aaaSR"),
+              #C29/(C26-30)aaaSR
+                ratio_peaks(., c("C29 aaa 20R ST", "C29 aaa 20S ST"), c("aaa 20R ST", "aaa 20S ST") , "C29/(C26-30)aaaSR"),
+              #C30/(C26-30)aaaSR
+                ratio_peaks(., c("C30 aaa 20R ST", "C30 aaa 20S ST"), c("aaa 20R ST", "aaa 20S ST") , "C30/(C26-30)aaaSR"),
+           
+              #C27/C27+C28aaa&abb
+                ratio_peaks(., c("C27 aaa 20R ST" , "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST"), c("C27 aaa 20R ST" , "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST", "C28 aaa 20R ST", "C28 aaa 20S ST", "C28 aBB 20R ST", "C28 aBB 20S ST")  , "C27/C27+C28aaa&abb"),
+              #C27/C27+C29aaa&abb
+                ratio_peaks(., c("C27 aaa 20R ST" , "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST"), c("C27 aaa 20R ST" , "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST", "C29 aaa 20R ST", "C29 aaa 20S ST", "C29 aBB 20R ST", "C29 aBB 20S ST")  , "C27/C27+C29aaa&abb"),
+              #C28/C28+C27aaa&abb
+                ratio_peaks(., c("C28 aaa 20R ST", "C28 aaa 20S ST", "C28 aBB 20R ST", "C28 aBB 20S ST"), c("C27 aaa 20R ST" , "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST", "C28 aaa 20R ST", "C28 aaa 20S ST", "C28 aBB 20R ST", "C28 aBB 20S ST")  , "C28/C28+C27aaa&abb"),
+              #C28/C28+C29aaa&abb
+                ratio_peaks(., c("C28 aaa 20R ST", "C28 aaa 20S ST", "C28 aBB 20R ST", "C28 aBB 20S ST"), c("C29 aaa 20R ST", "C29 aaa 20S ST", "C29 aBB 20R ST", "C29 aBB 20S ST", "C28 aaa 20R ST", "C28 aaa 20S ST", "C28 aBB 20R ST", "C28 aBB 20S ST")  , "C28/C28+C29aaa&abb"),
+              #C29/C29+C27aaa&abb
+                ratio_peaks(., c("C29 aaa 20R ST", "C29 aaa 20S ST", "C29 aBB 20R ST", "C29 aBB 20S ST"), c("C27 aaa 20R ST" , "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST", "C29 aaa 20R ST", "C29 aaa 20S ST", "C29 aBB 20R ST", "C29 aBB 20S ST")  , "C29/C29+C27aaa&abb"),
+              #C29/C29+C28aaa&abb
+                ratio_peaks(., c("C29 aaa 20R ST", "C29 aaa 20S ST", "C29 aBB 20R ST", "C29 aBB 20S ST"), c("C29 aaa 20R ST", "C29 aaa 20S ST", "C29 aBB 20R ST", "C29 aBB 20S ST", "C28 aaa 20R ST", "C28 aaa 20S ST", "C28 aBB 20R ST", "C28 aBB 20S ST")  , "C29/C29+C28aaa&abb"),
+              
+              #4Me_TriMe/Me_C26St
+                ratio_peaks(., c("4Me_TriMe"), c("4Me_TriMe", "C26 aBB 20S ST", "C26 aBB 20R ST", "C26 aaa 20S ST", "C26 aaa 20R ST") , "4Me_TriMe/Me_C26St"),
+              #4Me_TriMe/Me_C27St
+                ratio_peaks(., c("4Me_TriMe"), c("4Me_TriMe", "C27 aBB 20S ST", "C27 aBB 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST") , "4Me_TriMe/Me_C27St"),
+              #4Me_TriMe/Me_C28St
+                ratio_peaks(., c("4Me_TriMe"), c("4Me_TriMe", "C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST") , "4Me_TriMe/Me_C28St"),
+              #4Me_TriMe/Me_C29St
+                ratio_peaks(., c("4Me_TriMe"), c("4Me_TriMe", "C29 aBB 20S ST", "C29 aBB 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST") , "4Me_TriMe/Me_C29St"),
+              #4Me_TriMe/Me_C30St
+                ratio_peaks(., c("4Me_TriMe"), c("4Me_TriMe", "C30 aBB 20 R+S ST", "C30 aaa 20S ST", "C30 aaa 20R ST") , "4Me_TriMe/Me_C30St"),
+              #4Me_TriMe/Me_allSt
+                ratio_peaks(., c("4Me_TriMe"), c("4Me_TriMe", "allRegst") , "4Me_TriMe/Me_allSt"),
+           
+              #Dino/all
+                ratio_peaks(., "allDiacholestane", c("allSteranes", "allRegHO"), "Dino/all"),
+           
+              #C26-30St/C26-C30St+regHo 
+                ratio_peaks(., c("allRegst"), c("allRegst", "Ts C27 HO", "Tm C27 HO", "C27 17B HO", "29, 30 C28 bisnor HO", "28, 30 C28 bisnor HO", "C29 Ts HO", "C29 Ba HO", "C29 BB Ho", "C30 aB HO", "C30 BB HO", "C30H Ba HO", "C31 HR Ba HO", "C31 aB HR HO", "C31 aB HS HO", "C31 BB HO", "C32 aB HS HO", "C32 aB HR HO", "C33 aB HS HO", "C33 aB HR HO", "C34 aB HR HO", "C34 aB HS HO", "C35 aB HR HO", "C35 aB HS HO"), "C26-30St/C26-C30St_regHo"),
+              #C27-C30aaaSt/C27-C30aaaSt+regHo
+                ratio_peaks(., c( "C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aaa 20S ST", "C30 aaa 20R ST"), c("C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aaa 20S ST", "C30 aaa 20R ST", "allRegHO"), "C27-C30aaaSt/C27-C30aaaSt+regHo"),
+              #Ho/St
+                ratio_peaks(., "allRegHO", c("C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aaa 20S ST", "C30 aaa 20R ST"), "Ho/St"),
+              #Ho/St%
+                ratio_peaks(., "allRegHO", c("C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aaa 20S ST", "C30 aaa 20R ST", "allRegHO" ), "Ho/St%"),
+            
+              #C31_2MHI
+                ratio_peaks(., "C31 2a Me Ho", c("C30 aB HO", "C31 2a Me Ho" ), "C31_2MHI"),
+              #C31_35_2MHI
+                ratio_peaks(., c("C31 2a Me Ho", "C32 2aMe R HO", "C32 2aMe S HO", "C33 2aMe S HO", "C33 2aMe R HO", "C34 2a Me S HO", "C34 2a Me R HO", "C36 2a Me R HO", "C36 2a Me S HO"), c("C30 aB HO", "C31 2a Me Ho", "C32 2aMe R HO", "C32 2aMe S HO", "C33 2aMe S HO", "C33 2aMe R HO", "C34 2a Me S HO", "C34 2a Me R HO", "C36 2a Me R HO", "C36 2a Me S HO"), "C31_35_2MHI"),
+              #C31_2-MHI/C27-C30Steranes
+                ratio_peaks(., "C31 2a Me Ho", c("C26 aaa 20S ST", "C26 aaa 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST" ,"C28 aaa 20S ST", "C28 aaa 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aaa 20S ST", "C30 aaa 20R ST", "C31 2a Me Ho" ), "C31_2-MHI/C27-C30Steranes"),
+           #MeHo/allHo
+                ratio_peaks(., c("C31 2a Me Ho", "C32 2aMe R HO", "C32 2aMe S HO", "C33 2aMe S HO", "C33 2aMe R HO", "C34 2a Me S HO", "C34 2a Me R HO", "C36 2a Me R HO", "C36 2a Me S HO", "C31 3B Me HO", "C32 3B Me S HO", "C32 3B Me R HO", "C32 3B Me Ba 22S+R ST", "C33 3BMe S HO", "C33 3BMe R HO", "C34 3B Me S Ho", "C34 3B Me R HO", "C35 3B Me R HO", "C35 3B Me S HO", "C36 3B Me S HO", "C36 3B Me R HO" ), "allRegHO", "MeHo/allHo"), 
+           
+           #Thermal Maturity
+              #C27_Dia/Reg
+                ratio_peaks(., "C27Dia", "C27Reg", "C27Dia/Reg"),
+              #C27Dia_S/R
+                ratio_peaks(., "C27 aB 20S ST", "C27 aB 20R ST", "C27Dia_S/R"),
+              #C27Dia_S/S+R
+                ratio_peaks(., "C27 aB 20S ST", c("C27 aB 20S ST", "C27 aB 20R ST"), "C27Dia_S/S+R") ,
+              #C27Reg_abb/all 
+                 ratio_peaks(., c("C27 aBB 20R ST", "C27 aBB 20S ST"), c("C27 aaa 20R ST", "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST"), "C27Reg_abb/aaa"),
+              #C27RegaaaS/S+R
+                ratio_peaks(., "C27 aaa 20S ST", c("C27 aaa 20R ST", "C27 aaa 20S ST"), "C27Regaaa_S/S+R"), 
+              #C27RegabbS/S+R
+                ratio_peaks(., "C27 aBB 20S ST", c("C27 aBB 20S ST", "C27 aBB 20R ST"), "C27Regabb_S/S+R"),
+              #C28Dia/all
+                ratio_peaks(., c("C28 Ba 20S ST", "C28 Ba 20R ST"), c("C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST", "C28 Ba 20S ST", "C28 Ba 20R ST"), "C28Dia/all"),
+              #C28DiaS/S+R
+                ratio_peaks(., "C28 Ba 20S ST", c("C28 Ba 20S ST", "C28 Ba 20R ST"), "C28DiaS/S+R"),
+              #C28abb/all
+                ratio_peaks(., c("C28 aBB 20S ST", "C28 aBB 20R ST"), c("C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST"), "C28abb/all"),
+              #C28aaaS/S+R
+                ratio_peaks(., "C28 aaa 20S ST", c("C28 aaa 20S ST", "C28 aaa 20R ST"), "C28aaaS/S+R"),
+              #C28abbS/S+R
+                ratio_peaks(., "C28 aBB 20S ST", c("C28 aBB 20S ST", "C28 aBB 20R ST"), "C28abbS/S+R"),
+              #C29Dia/all
+                ratio_peaks(., c("C29 Ba 20S ST", "C29 Ba 20R ST"),  c("C29 Ba 20S ST", "C29 Ba 20R ST", "C29 aBB 20S ST", "C29 aBB 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST"), "C29Dia/all"),
+              #C29DiaS/S+R
+                ratio_peaks(., "C29 Ba 20S ST", c("C29 Ba 20S ST", "C29 Ba 20R ST"), "C29DiaS/S+R"),
+              #C29abb/all
+                ratio_peaks(., c("C29 aBB 20S ST", "C29 aBB 20R ST"), c( "C29 aaa 20S ST", "C29 aaa 20R ST", "C29 aBB 20S ST", "C29 aBB 20R ST" ), "C29abb/all"),
+              #C29aaaS/S+R
+                ratio_peaks(., "C29 aaa 20S ST", c("C29 aaa 20S ST", "C29 aaa 20R ST") , "C29aaaS/S+R"),
+              #C29abbS/S+R
+                ratio_peaks(., "C29 aBB 20S ST", c("C29 aBB 20S ST", "C29 aBB 20R ST"), "C29abbS/S+R"),
+              #C27Ts/Ts+Tm
+                ratio_peaks(., "Ts C27 HO", c("Ts C27 HO", "Tm C27  HO"), "C27Ts/Tm"),
+              #C28BNH29,30/28,30
+                ratio_peaks(., "29, 30 C28 bisnor HO", c("29, 30 C28 bisnor HO", "28, 30 C28 bisnor HO"), "C28BNH29,30/28,30"),
+              #C29Ts/Ts+ab
+                ratio_peaks(., "C29 Ts HO", c( "C29 aB HO", "C29 Ts HO"), "C29Ts/ab"),
+              #C29ba/ba+ab
+                ratio_peaks(.,"C29 Ba HO",  c("C29 aB HO", "C29 Ba HO"), "C29ba/ab"),
+              #C29bb/bb+ab
+                ratio_peaks(., "C29 BB Ho", c("C29 BB Ho", "C29 aB HO"), "C29bb/ab"),
+              #C30_30nor/30nor+ab
+                ratio_peaks(., "30-nor C30H HO", c("C30 aB HO", "30-nor C30H HO"),  "C30_30nor/ab"),
+              #C30ba/ba+ab
+                ratio_peaks(., "C30H Ba HO", c("C30 aB HO", "C30H Ba HO"), "C30ba/ab"),
+              #C31ba/ba+ab
+                ratio_peaks(., "C31 Ba HR HO", c("C31 aB HR HO", "C31 Ba HR HO"), "C31ba/ab"),
+              #C30bb/bb+ab
+                ratio_peaks(., "C30 BB HO", c("C30 aB HO", "C30 BB HO"), "C30bb/ab"),
+              #C31S/S+R
+                ratio_peaks(., "C31 aB HS  HO", c("C31 aB HR HO", "C31 aB HS  HO"), "C31S/S+R"),
+              #C32S/S+R
+                ratio_peaks(., "C32 aB HS HO", c("C32 aB HS HO", "C32 aB HR HO"), "C32S/S+R"),
+              #C33S/S+R
+                ratio_peaks(., "C33 aB HS HO", c("C33 aB HS HO", "C33 aB HR HO"), "C33S/S+R"),
+              #C34S/S+R
+                ratio_peaks(., "C34 aB HS HO", c("C34 aB HS HO", "C34 aB HR HO") , "C34S/S+R"),
+              #C35S/S+R
+                ratio_peaks(., "C35 aB HS HO", c("C35 aB HS HO", "C35 aB HR HO") , "C35S/S+R")
+      
+ ) }) %>% ungroup() 
+  
+final_data
+```
+
+
+# Bring in other data for comparison 
+
+## Aromatic Data
+```{r}
+aromatic_final_data <- read.csv("Aromatic_SRM_SH1") %>% select(`depth`, `conc_rock.ug_g`, var = `peak_name`) 
+
+aliphatic_final_data <- final_data %>% select(`depth`, `conc_rock.ug_g`, value = `ratio`, var = `peak_name`)
+
+SRM_all <- full_join(aromatic_final_data, aliphatic_final_data) 
+```
+
+
+```{r}
+rock_depth <- depth_and_rock_info %>% select(depth, rock.g) 
+
+SRM_all_depth <- left_join(SRM_all, rock_depth, by = "depth")
+```
+
+
+## n-Alkane Data
+```{r}
+alkane <- read_excel(file.path("metadata", "nalk_comp.xlsx")) %>% rename(depth = `meters`) %>% gather(var, value, `CPI`, `Pr/Ph`, `ACL-long`, `ACL-short`, `ACL-all`, `ngSCA/g rock`, `ngPr+Ph/g rock`, `ngLCA/g rock`, `LCA/SCA+LCA`, `SCA/LCA`)
+
+all_data <- full_join(SRM_all_depth, alkane)
+```
+
+## Inorganic geochem data
+
+```{r}
+osisotope <- read_excel(file.path("metadata", "SH1_Osi_forGarrett.xlsx")) %>% 
+  rename(depth = `Depth (m)`) 
+
+
+cisotope <- read_excel(file.path("metadata", "Appendix_Table1_geochemistry.xlsx")) %>% 
+  #rename columns
+  rename(depth = `Abs. depth (m)` , d13c_org = `Average δ13Corg (‰ VPDB)` , carb = `%Carbonate`, TOC = `%TOC`, d13c_carb = `Average δ13Ccarb (‰ VPDB)`) %>%
+  #remove columns not of interest
+  select(-`stdev δ13Corg`, -`δ13Ccarb stdev`, -`d18O-avg`, -`d18O stdev`, -`∆13C`, -`d13c_carb`)
+
+# combine data frames
+inorg_data <- bind_rows(
+  cisotope %>% gather(var, value, d13c_org, carb, TOC),
+  osisotope %>% gather(var, value, Osi)
+) %>% select(depth, var, value)
+
+
+all_data <- full_join(inorg_data, all_data)
+```
+
+
+## Interpolate TOC data from Jones et al., (2018) to OG sample set
+
+```{r}
+# show TOC - depth for interpolation
+TOCscale <- cisotope %>% select(TOC, depth) %>% arrange(depth)
+
+# provide depths to interpolate to (my data)
+extrapolated_TOC <-
+  data_frame(
+    depth = all_data$depth %>% unique()
+  ) %>% 
+  filter(!is.na(depth)) %>% 
+# interpolate by  mapping TOC on slope to depth, then apply my depths to that slope
+  mutate(
+    #in_range = depth <= max(TOCscale$depth) & depth >= min(TOCscale$depth),
+    TOC = map_dbl(depth, function(d) {
+      fit_data <- mutate(TOCscale, closest = abs(d - depth)) %>% arrange(closest)
+      m <- lm(TOC ~ depth, fit_data[1:2,])
+      p <- predict(m, data.frame(depth = d), se.fit = TRUE)
+      return(p$fit)
+    })
+  )
+
+ggplot() + 
+  aes(depth, TOC) + 
+  geom_line(data = TOCscale) +
+  geom_point(data = extrapolated_TOC)
+
+alldata_w_TOC <- left_join(all_data, extrapolated_TOC, by = "depth")
+```
+
+### Normalize to TOC
+
+```{r}
+alldata_n_TOC <- 
+  alldata_w_TOC %>%
+  group_by(depth) %>% 
+  mutate(
+    #return values to amount for normalization
+    amount.ug = conc_rock.ug_g * rock.g
+)%>% ungroup() %>% 
+  arrange(depth, var) 
+
+```
+
+
+```{r}
+alldata_n_TOC %>% group_by(depth) %>%
+  mutate(
+  conc_TOC = amount.ug / TOC
+)%>% ungroup() %>% 
+  arrange(depth, var)
+```
+
+
+
+## Interpolate timescale from Jones et al. (2018) to OG sample set 
+
+```{r}
+
+timescale <- read_excel(file.path("metadata", "Appendix_Table2_SH1_agemodel.xlsx")) %>% 
+  rename(depth = Depth) %>% 
+  arrange(depth)
+
+# extrapolation
+extrapolated_timescale <-
+  data_frame(
+    depth = alldata_n_TOC$depth %>% unique()
+  ) %>% 
+  filter(!is.na(depth)) %>% 
+  mutate(
+    in_range = depth <= max(timescale$depth) & depth >= min(timescale$depth),
+    ka = map_dbl(depth, function(d) {
+      fit_data <- mutate(timescale, closest = abs(d - depth)) %>% arrange(closest)
+      m <- lm(ka ~ depth, fit_data[1:10,])
+      p <- predict(m, data.frame(depth = d), se.fit = TRUE)
+      return(p$fit)
+    })
+  )
+
+ggplot() + 
+  aes(depth, ka) + 
+  geom_line(data = timescale) +
+  geom_point(data = extrapolated_timescale, mapping = aes(color = in_range))
+
+alldata_w_time <- left_join(alldata_n_TOC, extrapolated_timescale, by = "depth")
+```
+
+
+```{r}
+alldata_w_time %>% group_by(depth) %>%
+  mutate(
+  MAR =  30 * (2.5/10) 
+)%>% ungroup() %>% 
+  arrange(depth, var)
+
+##black shales = 2.5 g/cm3
+## bulk MAR (g/cm2/k.y.) = LSR (m/m.y.) x dry density (g/cm3)/10.
+```
+
+# Plot Individuals 
+
+## Plot by TOC
+
+```{r "", fig.width = 20, fig.height = 5}
+toTOC <- subset(alldata_w_time, var %in% c( "Chlorobactane", "Isorenieretane", "28, 30 C28 bisnor HO", "3MeHo_all", "all_PAH", "gamma HO", "2MeHo_all", "C30 aB HO")) %>%
+  ggplot() +
+  aes(x = ka, y = conc_TOC, color = var) +
+  geom_point() +
+  #geom_line() +
+  facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+ggplotly(toTOC)
+```
+
+
+```{r}
+d13c <- subset(alldata_w_time, var == "d13c_org") %>%
+  ggplot() +
+  geom_line() +
+  aes(x = ka, y = value) +
+  #facet_grid(~var, scales = "free")+
+  #scale_x_reverse() +
+  scale_y_continuous() +
+  coord_flip() 
+
+d13c2 <- subset(alldata_w_time, var == "d13c_org") %>%
+  filter(ka < 250) %>%
+  ggplot() +
+  geom_line() +
+  aes(x = ka, y = value) +
+  #facet_grid(~var, scales = "free")+
+  #scale_x_reverse() +
+  scale_y_continuous() +
+  coord_flip() 
+ggplotly(d13c2)
+```
+
+
+## Sterane - Source
+
+### Regular steranes over all steranes
+
+```{r}
+sterane_area <- subset(alldata_w_time, var %in% c("C26St/allSt", "C27St/allSt", "C28St/allSt", "C29St/allSt", "C30St/allSt", "C30Me/allSt", "DinoSt/allSt")) %>%
+  ggplot() +
+  geom_area(mapping = aes(fill = var)) +
+  aes(x = ka, y = value, color = var) +
+  #facet_grid(~peak_name, scales = "free") +
+  coord_flip() +
+  #scale_x_reverse() +
+  scale_y_continuous() 
+
+sterane_area2 <- subset(alldata_w_time, var %in% c("C26St/allSt", "C27St/allSt", "C28St/allSt", "C29St/allSt", "C30St/allSt", "C30Me/allSt", "DinoSt/allSt")) %>%
+  filter(ka < 250) %>%
+  ggplot() +
+  geom_area(mapping = aes(fill = var)) +
+  aes(x = ka, y = value, color = var) +
+  #facet_grid(~peak_name, scales = "free") +
+  coord_flip() +
+  #scale_x_reverse() +
+  scale_y_continuous() 
+
+ggplotly(sterane_area2)
+```
+
+```{r}
+C26St_conc <-  subset(alldata_w_time, var %in% c("C26Regst", "C27Regst", "C28Regst", "C29Regst", "C30Regst")) %>%
+  ggplot() +
+  aes(x = ka, y = conc_rock.ug_g, color = var) +
+  #facet_grid(~var, scales = "free") +
+  geom_point() +
+  geom_line() +
+  coord_flip() +
+ # scale_x_reverse() +
+  scale_y_continuous()
+
+ggplotly(C26St_conc)
+```
+
+
+```{r}
+sterane_ratios <- subset(alldata_w_time, var %in% c( "C27St/allSt", "C28St/allSt", "C29St/allSt")) %>%
+  ggplot() +
+  aes(x = ka, y = value, color = var) +
+  facet_grid(~var, scales = "free") +
+  geom_point() +
+  geom_line() +
+  coord_flip() +
+ # scale_x_reverse() +
+  scale_y_continuous()
+
+sterane_ratios2 <- subset(alldata_w_time, var %in% c("C26St/allSt", "C27St/allSt", "C28St/allSt", "C29St/allSt", "C30St/allSt", "C30Me/allSt", "DinoSt/allSt")) %>%
+  filter(ka < 250) %>%
+  ggplot() +
+  aes(x = ka, y = value, color = var) +
+  #facet_grid(~var, scales = "free") +
+  geom_point() +
+  geom_line() +
+  coord_flip() +
+  #scale_x_reverse() +
+  scale_y_continuous()
+
+ggplotly(sterane_ratios)
+```
+
+## Hopanes - Source
+
+### Tricyclics
+
+
+```{r}
+tri <- subset(alldata_w_time, var %in% c("C19/tricyclics" , "C20/tricyclics" , "C21/tricyclics" , "C22/tricyclics" , "C23/tricyclics" , "C24/tricyclics" , "C25/tricyclics" , "C26/tricyclics")) %>%
+  ggplot() +
+  geom_area(mapping = aes(fill = var)) +
+  aes(x = ka, y = value, color = var) +
+  #facet_wrap(~peak_name, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+tri2 <- subset(alldata_w_time, var %in% c("C19/tricyclics" , "C20/tricyclics" , "C21/tricyclics" , "C22/tricyclics" , "C23/tricyclics" , "C24/tricyclics" , "C25/tricyclics" , "C26/tricyclics")) %>%
+  filter(ka < 250) %>%
+  ggplot() +
+  geom_area(mapping = aes(fill = var)) +
+  aes(x = ka, y = value, color = var) +
+  #facet_wrap(~peak_name, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+triline <- subset(alldata_w_time, var %in% c("C19/tricyclics" ,  "C23/tricyclics" , "C24/tricyclics" )) %>%
+  filter(ka < 250) %>%
+  ggplot() +
+  geom_point()+
+  geom_line() +
+  #geom_area(mapping = aes(fill = var)) +
+  aes(x = ka, y = value, color = var) +
+  #facet_wrap(~peak_name, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+ggplotly(tri)
+
+```
+
+```{r "", fig.width = 5, fig.height = 5}
+olconc <- subset(alldata_w_time, var ==  "Oleanane HO") %>%
+  ggplot() +
+  aes(x = ka, y = conc_rock.ug_g) +
+  geom_point() +
+  #geom_line() +
+  #facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+ggplotly(olconc)
+```
+
+### Hopanes over steranes
+```{r "", fig.width = 5, fig.height = 5}
+vertical_lines <- data_frame(
+    one = 1
+  )
+
+host <- subset(alldata_w_time, var == "Ho/St") %>%
+  ggplot() +
+  aes(x = ka, y = value) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~var, scales = "free") +
+  geom_hline(vertical_lines,
+             mapping = aes(yintercept = one)) +
+  #scale_x_reverse() +
+  coord_flip() 
+  
+host2 <- subset(alldata_w_time, var == "Ho/St") %>%
+  filter(ka < 250) %>%
+  ggplot() +
+  aes(x =ka, y = value) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~var, scales = "free") +
+  geom_hline(vertical_lines,
+             mapping = aes(yintercept = one)) +
+  #scale_x_reverse() +
+  coord_flip() 
+```
+
+
+### Hopanes and steranes combined
+```{r "", fig.width = 20, fig.height = 5}
+ho <- subset(alldata_w_time, var %in% c("C29ab/allHoab","C30ab/allHoab", "C31ab/allHoab", "C32ab/allHoab", "C33ab/allHoab", "C34ab/allHoab", "C35ab/allHoab")) %>%
+   ggplot() +
+  geom_area(mapping = aes(fill = var)) +
+  aes(x = ka, y = value, color = var) +
+  #facet_wrap(~peak_name, scales = "free") +
+  coord_flip() +
+  #scale_x_reverse() +
+  scale_y_continuous() 
+
+ho2 <- subset(alldata_w_time, var %in% c("C29ab/allHoab","C30ab/allHoab", "C31ab/allHoab", "C32ab/allHoab", "C33ab/allHoab", "C34ab/allHoab", "C35ab/allHoab")) %>%
+  filter(ka < 250) %>%
+   ggplot() +
+  geom_area(mapping = aes(fill = var)) +
+  aes(x = ka, y = value, color = var) +
+  #facet_wrap(~peak_name, scales = "free") +
+  coord_flip() +
+  #scale_x_reverse() +
+  scale_y_continuous() 
+
+
+holine <- subset(alldata_w_time, var %in% c("C29ab/allHoab","C30ab/allHoab", "C31ab/allHoab", "C32ab/allHoab", "C33ab/allHoab", "C34ab/allHoab", "C35ab/allHoab")) %>%
+   ggplot() +
+  #geom_area(mapping = aes(fill = var)) +
+  aes(x = ka, y = value, color = var) +
+  geom_point()+
+  geom_line()+
+  #facet_wrap(~peak_name, scales = "free") +
+  coord_flip() +
+  #scale_x_reverse() +
+  scale_y_continuous() 
+
+ggplotly(holine)
+```
+
+### Hopanes
+```{r "", fig.width = 20, fig.height = 5}
+mehi <- subset(alldata_w_time, var %in% c( "C31_35_2MHI", "C31_35_3MHI(%)", "MeHo/allHo", "Ho/St", "3MeHo_all"))%>%
+  ggplot() +
+  aes(x = ka, y = value, color = var) +
+  geom_point() +
+  geom_line() +
+  facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+mehi2 <- subset(alldata_w_time, var %in% c( "C31_35_2MHI", "C31_35_3MHI(%)", "MeHo/allHo", "Ho/St", "3MeHo_all"))%>%
+  filter(ka < 250) %>%
+  ggplot() +
+  aes(x = ka, y = value, color = var) +
+  geom_point() +
+  geom_line() +
+  facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+#This suggests 3Me Hopanes dominate the methylatede hopane pool. i.e. aerobic methanotrophs dominate over anoxygenic clades/cyanos
+##112 depth shoes huge hit to 3Me's, followed by gradual increase thruout
+
+ggplotly(mehi2)
+```
+
+
+```{r "", fig.width = 20, fig.height = 5}
+conc_3Me <- subset(alldata_w_time, var == "3MeHo_all")%>%
+  ggplot() +
+  aes(x = ka, y = conc_rock.ug_g) +
+  geom_point() +
+  geom_line()+
+  #facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+conc_3Me2 <- subset(alldata_w_time, var == "3MeHo_all")%>%
+  filter(ka < 250) %>%
+  ggplot() +
+  aes(x = ka, y = conc_rock.ug_g) +
+  geom_point() +
+  geom_line()+
+  #facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+#threeme_conc <- grid.arrange(mehi, conc_3Me, ncol = 2)
+#this shows that the above increases are really restricted to the "cold event" interval - lines up exactly with PAH increase
+```
+
+### Stratification
+```{r "", fig.width = 20, fig.height = 5}
+HHIGI <- subset(alldata_w_time, var %in% c("d13c_org", "HHI", "Chlorobactane", "Isorenieretane", "C31_35_3MHI(%)", "GI")) %>%
+  ggplot() +
+  aes(x = ka, y = value, color = var) +
+  geom_point() +
+  #geom_line() +
+  facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+ggplotly(HHIGI)
+```
+
+```{r}
+ThreeMeHo <- subset(alldata_w_time, var %in% c("28, 30 C28 bisnor HO", "3MeHo_all")) %>%
+  ggplot() +
+  aes(x = ka, y = conc_rock.ug_g, color = var) +
+  geom_point() +
+  #geom_smooth() +
+  facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+ggplotly(ThreeMeHo)
+```
+
+```{r}
+cross1 <- subset(alldata_w_time, value = conc_rock.ug_g) %>%
+  ggplot() +
+  aes(x = "28, 30 C28 bisnor HO", y = "3MeHo_all", color = var) +
+  geom_point() +
+  #geom_smooth() +
+  facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+
+ggplotly(cross1)
+```
+
+
+## Thermal Maturity
+
+### Dia and clay
+```{r "", fig.width = 15, fig.height = 5}
+dia <- subset(alldata_w_time, var %in% c("C27Dia","C28 Ba 20S ST", "C28 Ba 20R ST", "C29 Ba 20S ST", "C29 Ba 20R ST", "C30H Ba HO" )) %>%
+  filter(conc_rock.ug_g < 200) %>%
+  ggplot() +
+  aes(x = depth, y = conc_rock.ug_g, color = var) +
+  geom_point() +
+  #geom_smooth() +
+  facet_grid(~var, scales = "free") +
+  scale_x_reverse() +
+  coord_flip()
+
+#ggplotly(dia)
+```
+
+```{r "", fig.width = 15, fig.height = 5}
+carb <- subset(alldata_w_time, var == "carb") %>%
+  ggplot() +
+  aes(x = depth, y = value) +
+  geom_point() +
+  geom_line() +
+  #geom_smooth() +
+  facet_grid(~var, scales = "free") +
+  scale_x_reverse() +
+  coord_flip()
+
+#claydias <- grid.arrange(carb, dia, ncol = 2)
+#note: limited x axis to 200 ug/g rock to help visualize trends
+```
+
+
+### Dias
+```{r "", fig.width = 15, fig.height = 5}
+diasr <- subset(alldata_w_time, var%in% c("C28DiaS/S+R" , "C29DiaS/S+R", "C28Dia/all", "C29Dia/all")) %>%
+  filter(depth != 116.490) %>% filter(depth != 116.900) %>%
+  ggplot() +
+  aes(x = depth, y = value, color = var) +
+  geom_point() +
+  geom_line() +
+  facet_grid(~var, scales = "free") +
+  scale_x_reverse() +
+  coord_flip()
+#ggplotly(diasr)
+```
+
+
+
+
+### aaa_S/S+R
+```{r "", fig.width = 8, fig.height = 5}
+aaa<- alldata_w_time %>%
+  filter(var %in% c("C27Regaaa_S/S+R", "C28aaaS/S+R", "C29aaaS/S+R")) %>%
+  filter(depth != 115.885) %>%
+  ggplot() +
+  aes(x = depth, y = value, color = var) +
+  geom_line() +
+  geom_point() +
+  #facet_grid(~var, scales = "free") +
+  scale_x_reverse() +
+  coord_flip()
+
+ggplotly(aaa)
+```
+
+
+
+### C28/9abb/all
+```{r "", fig.width = 8, fig.height = 5}
+eightnine <- subset(alldata_w_time, var %in% c("C28abb/all", "C29abb/all"))  %>%
+  filter(depth != 115.885) %>%
+  ggplot() +
+  aes(x = depth, y = value, color = var) +
+  geom_point() +
+  geom_line() +
+  #facet_wrap(~pvar, scales = "free") +
+  scale_x_reverse() +
+  coord_flip() 
+
+#ggplotly(eightnine)
+```
+
+
+### C27Ts/Tm
+```{r "", fig.width = 5, fig.height = 5}
+tstm <- subset(alldata_w_time, var %in% c("C27Ts/Tm", "C29Ts/ab")) %>%
+  filter(depth != 115.885) %>% filter(depth != 120.405) %>%
+  ggplot() +
+  aes(x = depth, y = value, color = var) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~var, scales = "free") +
+  scale_x_reverse() +
+  coord_flip()
+#ggplotly(tstm)
+```
+
+
+
+### C29,30ba/ab
+```{r "", fig.width = 5, fig.height = 5}
+baab <- subset(alldata_w_time, var %in% c("C29ba/ab", "C30ba/ab")) %>%
+  ggplot() +
+  aes(x = depth, y = value, color = var) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~var, scales = "free") +
+  scale_x_reverse() +
+  coord_flip()
+
+#ggplotly(baab)
+```
+
+
+ 
+### C30 ab&ba
+```{r "", fig.width = 5, fig.height = 5}
+thabba <- subset(alldata_w_time, var %in% c("C30 aB HO", "C30H Ba HO")) %>%
+  ggplot() +
+  aes(x = depth, y = conc_rock.ug_g, color = var) +
+  geom_point() + 
+  geom_line() +
+  #facet_wrap(~peak_name) +
+  scale_x_reverse() +
+  coord_flip()
+#ggplotly(thabba)
+```
+
+
+### C29bb/ab
+```{r "", fig.width = 5, fig.height = 5}
+bbab <- subset(alldata_w_time, var %in% c("C29bb/ab", "C30bb/ab")) %>%
+  ggplot() +
+  aes(x = depth, y = value, color = var) +
+  geom_point() +
+  geom_line() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_x_reverse() +
+  coord_flip()
+ggplotly(bbab)
+#BB from soil bacteria?
+```
+
+
+
+
+
+### All Ho S/R
+```{r "", fig.width = 10, fig.height = 5}
+srho <- alldata_w_time %>%
+  filter(var %in% c("C31S/S+R", "C32S/S+R", "C33S/S+R", "C34S/S+R", "C35S/S+R")) %>%
+  filter(value > 0.1) %>%
+  ggplot() +
+  aes(x = depth, y = value, color = var) +
+  geom_point() +
+  geom_line() +
+  #facet_grid(~peak_name) +
+  scale_x_reverse() +
+  coord_flip()
+#ggplotly(srho)
+```
+
+
+
+### Everything
+```{r "everything", fig.width = 15, fig.height = 5}
+erry <- alldata_w_time %>%
+  filter(var == "everything") %>%
+  ggplot() +
+  aes(x = depth, y = conc_rock.ug_g) +
+  geom_point() +
+  geom_line() +
+  facet_grid(~var) +
+  scale_x_reverse() +
+  coord_flip()
+#ggplotly(erry)
+
+#all <- grid.arrange(d13c, carb, erry, ncol = 3)
+```
+
+# Final Plot Groups
+
+## Environmental 
+
+### Climate
+```{r "", fig.width = 15, fig.height = 5}
+# Note the y axis in depth. If I can find an absolute time for "0", I'd like to make these absolute dates. 
+test <- subset(alldata_w_time, var %in% c("d13c_org", "ACL-long", "all_PAH",  "Oleanane Index")) %>%
+  ggplot()+
+  aes(ka, value, color = var)+
+  geom_point() +
+  #geom_line() +
+  facet_grid(~var, scales = "free")+
+  coord_flip()
+ggplotly(test)
+
+```
+
+
+### Alkanes
+```{r "all alkane proxies", fig.width = 20, fig.height= 5}
+
+alk <- subset(alldata_w_time, var %in% c("d13c_org", "ACL-long", "CPI", "LCA/SCA+LCA", "Pr/Ph", "ngSCA/g rock", "SCA/LCA", "ngLCA/g rock")) %>%
+  ggplot()+
+  aes(ka, value, color = var)+
+  geom_point() +
+  geom_line() +
+  facet_grid(~var, scales = "free")+
+  coord_flip()
+ggplotly(alk)
+
+
+alk2 <- subset(alldata_w_time, var %in% c("d13c_org", "ACL-long", "CPI", "LCA/SCA+LCA", "Pr/Ph", "ngSCA/g rock", "SCA/LCA", "ngLCA/g rock")) %>%
+  filter(ka < 250) %>%
+  ggplot()+
+  aes(ka, value, color = var)+
+  geom_point() +
+  geom_line() +
+  facet_grid(~var, scales = "free")+
+  coord_flip()
+ggplotly(alk2)
+
+```
+
+### Terrestrial input 
+```{r "", fig.width = 15, fig.height = 5}
+terr <- subset(alldata_w_time, var %in% c("carb", "ngLCA/g rock", "C19/C19+23" , "OleananeIndex", "C29ab/allHoab", "C24tet/tricyclics")) %>%
+  ggplot() +
+  aes(x = ka, y = value, color = var) +
+  geom_point() +
+  #geom_line() +
+  facet_grid(~var, scales = "free") +
+  #scale_x_reverse() +
+  coord_flip()
+ggplotly(terr)
+
+# all suggest most terrestial input at onset of event (before 120m), and perhaps elevated input around 107m
+# C29 hopane follows C19 tricyclic - perhaps c29 from soil bacteria?
+```
+
+## Marine Ecology
+
+### Steranes
+```{r "steranes", fig.width = 25, fig.height = 10}
+grid.arrange(d13c, sterane_area, sterane_ratios,  ncol = 3)
+
+grid.arrange(d13c2, sterane_area2, sterane_ratios2,  ncol = 3)
+```
+
+```{r}
+ggplotly(sterane_area)
+ggplotly(sterane_ratios)
+```
+
+
+### Hopanes
+```{r "tricyclics", fig.width = 20, fig.height = 10}
+grid.arrange(d13c, tri, ho, host, ncol = 4)
+
+grid.arrange(d13c2, tri2, ho2, host2, ncol = 4)
+#C24tricyclic starts dominant but decreases at expense of c23, c26
+# C31 seems to control the pulses of hopane increase seen in Ho/St
+```
+
+### Sterane and Hopane overview
+```{r "", fig.width = 20, fig.height = 10}
+grid.arrange(d13c, ho, sterane_area, ncol=3)
+
+grid.arrange(d13c2, ho2, sterane_area2, ncol=3)
+```
+
+```{r}
+ggplotly(ho)
+ggplotly(tri)
+ggplotly(host)
+```
+
+
+## Redox
+```{r "Stratification", fig.width =25, fig.height = 10}
+ggplotly(HHIGI)
+```
+
+## Thermal Maturity
+
+### Sterane and Hopane S/R
+```{r "", fig.width = 20, fig.height = 10}
+grid.arrange(aaa, srho, ncol = 2)
+```
+
+
+### Moretane, Ts/Tm, Ho/St (per French et al 2012)
+```{r "", fig.width = 20 , fig.height = 10}
+grid.arrange(baab, tstm, host, carb, ncol = 4)
+# moretane does anticorrelate with ts/tm 
+## BB --> Ba --> aB ; more preservation with clays as clays adsorb and protect polar hopane precursors
+##low values of ts/tm coincide with higher clay content in French 2012 - here we see the opposite, suggesting that thermal maturity controls
+```
+
+
+### Dias
+```{r "diasr", fig.width = 20, fig.height = 10}
+ggplotly(diasr)
+```
+
+
+### Dias and clay
+```{r "", fig.width = 20, fig.height = 10}
+grid.arrange(carb, dia, ncol = 2)
+#note: limited x axis to 200 ug/g rock to help visualize trends
+```

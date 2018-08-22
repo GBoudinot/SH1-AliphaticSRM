@@ -1,0 +1,723 @@
+---
+title: "2018_Ari_aliphatic_thermalmaturity"
+output: html_document
+---
+# Start up functions
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r "load libraries", echo = FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(stringr)
+library(knitr)
+library(readxl)
+library(tidyr)
+library(purrr)
+library(xlsx)
+opts_chunk$set(dev=c("png", "pdf"), dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path = file.path("plots", "MSC_SRM")) ### CHANGE PLOT SUFFIX ###
+```
+
+# Read and organize data
+```{r}
+read_srm_export <- function(filename, columns = c("peak_name", "RT.min", "basepeak", "area.cpm", "height.cts", "quantitation")) {
+  filename %>% 
+    # read excel files
+    read_excel(sheet = "Integration", skip = 42, 
+               col_names = columns, col_types = rep("text", length(columns))) %>% 
+    as_data_frame() %>%
+    # remove empty rows
+    filter(!is.na(peak_name), peak_name != "n.a.") %>% 
+    # convert the relevant numeric columns into numbers
+    mutate_at(vars(RT.min, area.cpm, height.cts), as.numeric) %>% 
+    # remove useless columns
+    select(-basepeak, -quantitation) %>% 
+    # add filename info
+    mutate(file_id = gsub("\\.xls", "", basename(filename))) %>% 
+    select(file_id, everything())
+}
+
+# get data
+all_data <- 
+  # find all excel files ##change name and use new folder for new project
+  list.files("data_ari", recursive = TRUE, full.names = TRUE, pattern = "\\.xls$") %>% 
+  # send them to the read method
+  lapply(read_srm_export) %>% 
+  # combine the data set
+  bind_rows() %>% 
+  # pull out sample information
+  #mutate(sample_id = str_match(all_data$file_id, "TSQ\\d+_GB_(.*)$") %>% { .[,2] }) %>% 
+  # get n replicates
+  group_by(file_id)
+  #mutate(n_replicates = length(unique(file_id)))
+
+```
+
+## File names for metadata file
+```{r, echo=FALSE, eval=FALSE}
+# file names
+all_data$file_id %>% unique() %>%  paste(collapse = "\n") %>% message()
+```
+
+#Plot to check the spread
+##by sequence
+```{r "all area"}
+all_data %>% 
+  ggplot() + 
+  aes(x = peak_name, y = area.cpm, color = file_id) +
+  geom_point(size = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+##by sample
+```{r}
+all_data %>% 
+  ggplot() +
+  aes(x = file_id, y = area.cpm, color = file_id) + 
+  geom_point(size = 3) +
+  facet_wrap(~peak_name, scales = "free_y") +
+    theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "none")
+```
+
+# Calculation peak amounts and rock concentrations, ID standards
+
+```{r}
+depth_and_rock_info <- read_excel(file.path("metadata", "aliphaticSRM_MSC.xlsx")) %>% 
+  rename(tle = `TLE.mg`, maltene = `maltenes.mg`, ref_amount_added.ug = `D4.ug` ) %>% 
+  filter(!is.na(file_id))
+kable(depth_and_rock_info)
+```
+
+```{r}
+data_by_depth <- 
+  all_data %>%
+  left_join(depth_and_rock_info, by = "file_id") %>% 
+  group_by(file_id) %>% 
+  mutate(
+    n_peaks = n(),
+    n_standards = sum(peak_name == "D4 C29 ISTD"),
+    ref_area.cpm = area.cpm[peak_name == "D4 C29 ISTD"],
+    amount.ug = area.cpm/ref_area.cpm * ref_amount_added.ug,
+   
+    #Normalize by what you want
+    conc_rock.ug_g = amount.ug / rock.g, 
+    conc_tle.ug.g = amount.ug / tle,  
+    conc_maltene.ug.g = amount.ug / maltene
+    
+  )%>% ungroup() %>% 
+  arrange(file_id, peak_name) 
+
+data_by_depth
+```
+
+# Calculate Recovery
+
+### Linear regressions of the calibration curves
+
+```{r}
+standard <- read_excel(file.path("metadata", "D4_calibration.xlsx"))   ###read excel
+
+###calibration curve
+standard %>% 
+  ggplot() +
+  aes(x = Known.ng, y = Measured_area.counts, color = calibration) + 
+  geom_smooth(method = "lm", alpha = 0.5) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none") 
+ 
+calibrations <- 
+  standard %>% 
+  filter(!is.na(calibration)) %>% 
+  nest(-calibration) %>% 
+  mutate(
+    fit = map(data, ~summary(lm(`Measured_area.counts`~ `Known.ng`, data = .x))),
+    coefficients = map(fit, "coefficients"),
+    intercept = map_dbl(coefficients, `[`, 1, 1),
+    intercept_se = map_dbl(coefficients, `[`, 1, 2),
+    slope = map_dbl(coefficients, `[`, 2, 1),
+    slope_se = map_dbl(coefficients, `[`, 2, 2),
+    r2 = map_dbl(fit, "r.squared")
+  )
+```
+
+### Determine yield
+
+These numbers are not useful for anything else.
+
+```{r}
+calib_data <-
+  data_by_depth %>% 
+  # temp
+  mutate(calibration = "jan2018") %>% 
+  left_join(calibrations, by = "calibration") %>% 
+  mutate(
+    total_volume.uL = 100,
+    total_inject.uL = 1.5,
+    ref_amount_inject_expected.ng = (ref_amount_added.ug * 1000)/total_volume.uL * total_inject.uL ,
+    ref_amount_inject_measured.ng = (ref_area.cpm - intercept)/slope,
+    ref_amount_measured.ug = ((total_volume.uL* ref_amount_inject_measured.ng)/total_inject.uL) * 1/1000,
+    yield = (ref_amount_inject_measured.ng/ref_amount_inject_expected.ng) * 100
+  )
+  
+calib_data
+```
+
+#### check yields
+
+```{r}
+calib_data %>% 
+  select(file_id, peak_name, yield)  %>% 
+  arrange(file_id)  %>% 
+  unique() %>% 
+  ggplot() + aes(file_id, y = yield) +
+  geom_point(size = 3) +
+  theme_bw() + theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5))
+```
+
+
+#Combine compounds/make ratios (new rows w/o RTs etc, just concentration.rock column)
+
+```{r}
+# functions to make it easy to sum up peaks
+
+sum_peaks <- function(df, filter_condition, new_peak_name) {
+  filter_condition <- sprintf("(%s)", str_c(filter_condition, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_condition)) %>% 
+    summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      conc_rock.ug_g = sum(conc_rock.ug_g)
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+
+ratio_peaks <- function(df, filter_top, filter_bottom, new_peak_name) {
+  filter_top <- sprintf("(%s)", str_c(filter_top, collapse = "|"))
+  filter_bottom <- sprintf("(%s)", str_c(filter_bottom, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_top) | str_detect(peak_name, filter_bottom)) %>% 
+    summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      ratio = sum(conc_rock.ug_g[str_detect(peak_name, filter_top)]) / sum(conc_rock.ug_g[str_detect(peak_name, filter_bottom)])
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+```
+
+##Ideas for other ratios? What about dimethyls?
+```{r}
+#set values to use for later calculations
+final_data1 <- calib_data %>% 
+    group_by(file_id) %>% 
+        do({
+          bind_rows(., 
+              #C27_Dia/Reg
+                sum_peaks(.,  c("C27 aB 20R ST", "C27 aB 20S ST"), "C27Dia"),      
+                sum_peaks(., c("C27 aaa 20R ST", "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST", "C27 Ba 20R ST", "C27 Ba 20S ST"), "C27Reg"),
+            
+              #Total Tricyclics
+                sum_peaks(., c("C19 Tri HO", "C20 Tri HO", "C21 Tri HO", "C22 Tri HO", "C23 Tri HO", "C24 Tet HO", "C24 Tri HO", "C25 Tri R HO", "C25 Tri S HO", "C26 Tri R HO", "C26 Tri S HO"), "all_tricyclics"),
+            
+              #4Me_TriMe
+                sum_peaks(., c("4B Me 5a cholestane", "4B Me 24 ethyl 5a cholestane", "4B,23S,24S trimethyl 5a cholestane", "4B,23S,24R trimethyl 5a cholestane", "4B,23R,24S trimethyl 5a cholestane", "4B,23R,24R trimethyl 5a cholestane", "4a Me 5a cholestane", "4a Me 24 ethyl 5a cholestane", "4a,23S,24S trimethyl 5a cholestane", "4a,23S,24R trimethyl 5a cholestane", "4a,23R,24S trimethyl 5a cholestane", "4a,23R,24R trimethyl 5a cholestane"), "4Me_TriMe"),
+            
+              #allRegSt
+                sum_peaks(., c("C26 aBB 20S ST", "C26 aBB 20R ST", "C26 aaa 20S ST", "C26 aaa 20R ST","C27 aBB 20S ST", "C27 aBB 20R ST", "C27 aaa 20S ST", "C27 aaa 20R ST", "C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST","C29 aBB 20S ST", "C29 aBB 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST", "C30 aBB 20 R+S ST", "C30 aaa 20S ST", "C30 aaa 20R ST"), "allRegst"),
+            
+              #allRegHO
+                sum_peaks(., c("Ts C27 HO", "Tm C27 HO", "C27 17B H Ho", "29, 30 C28H bisnor HO", "28, 30 C28 bisnor HO", "C29 Ts HO", "C29 Ba HO", "C29 BB Ho", "C30 aB HO", "C30 BB HO", "C30H Ba HO", "C31 HR Ba HO", "C31 aB HR HO", "C31 aB HS HO", "C31 BB HO", "C32 aB HS HO", "C32 aB HR HO", "C33 aB HS HO", "C33 aB HR HO", "C34 aB HR HO", "C34 aB HS HO", "C35 aB HR HO", "C35 aB HS HO"), "allRegHO") 
+            
+) }) %>% ungroup()
+
+```
+            
+```{r}
+final_data <- final_data1 %>% 
+    group_by(file_id) %>% 
+        do({
+          bind_rows(., 
+            #Thermal Maturity
+              #C27_Dia/Reg
+                ratio_peaks(., "C27Dia", "C27Reg", "C27Dia/Reg"),
+              #C27Dia_S/R
+                ratio_peaks(., "C27 aB 20S ST", c("C27 aB 20R ST", "C27 aB 20S ST"), "C27Dia_S/R"),
+              #C27Reg_abb/all 
+                 ratio_peaks(., c("C27 aBB 20R ST", "C27 aBB 20S ST"), c("C27 aaa 20R ST", "C27 aaa 20S ST", "C27 aBB 20R ST", "C27 aBB 20S ST"), "C27Reg_abb/aaa"),
+              #C27RegaaaS/S+R
+                ratio_peaks(., "C27 aaa 20S ST", c("C27 aaa 20R ST", "C27 aaa 20S ST"), "C27Regaaa_S/S+R"), 
+              #C27RegabbS/S+R
+                ratio_peaks(., "C27 aBB 20S ST", c("C27 aBB 20S ST", "C27 aBB 20R ST"), "C27Regabb_S/S+R"),
+              #C28Dia/all
+                ratio_peaks(., c("C28 Ba 20S ST", "C28 Ba 20R ST"), c("C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST", "C28 Ba 20S ST", "C28 Ba 20R ST"), "C28Dia/all"),
+              #C28DiaS/S+R
+                ratio_peaks(., "C28 Ba 20S ST", c("C28 Ba 20S ST", "C28 Ba 20R ST"), "C28DiaS/S+R"),
+              #C28abb/all
+                ratio_peaks(., c("C28 aBB 20S ST", "C28 aBB 20R ST"), c("C28 aBB 20S ST", "C28 aBB 20R ST", "C28 aaa 20S ST", "C28 aaa 20R ST"), "C28abb/all"),
+              #C28aaaS/S+R
+                ratio_peaks(., "C28 aaa 20S ST", c("C28 aaa 20S ST", "C28 aaa 20R ST"), "C28aaaS/S+R"),
+              #C28abbS/S+R
+                ratio_peaks(., "C28 aBB 20S ST", c("C28 aBB 20S ST", "C28 aBB 20R ST"), "C28abbS/S+R"),
+              #C29Dia/all
+                ratio_peaks(., c("C29 Ba 20S ST", "C29 Ba 20R ST"),  c("C29 Ba 20S ST", "C29 Ba 20R ST", "C29 aBB 20S ST", "C29 aBB 20R ST", "C29 aaa 20S ST", "C29 aaa 20R ST"), "C29Dia/all"),
+              #C29DiaS/S+R
+                ratio_peaks(., "C29 Ba 20S ST", c("C29 Ba 20S ST", "C29 Ba 20R ST"), "C29DiaS/S+R"),
+              #C29abb/all
+                ratio_peaks(., c("C29 aBB 20S ST", "C29 aBB 20R ST"), c( "C29 aaa 20S ST", "C29 aaa 20R ST", "C29 aBB 20S ST", "C29 aBB 20R ST" ), "C29abb/all"),
+              #C29aaaS/S+R
+                ratio_peaks(., "C29 aaa 20S ST", c("C29 aaa 20S ST", "C29 aaa 20R ST") , "C29aaaS/S+R"),
+              #C29abbS/S+R
+                ratio_peaks(., "C29 aBB 20S ST", c("C29 aBB 20S ST", "C29 aBB 20R ST"), "C29abbS/S+R"),
+              #C27Ts/Ts+Tm
+                ratio_peaks(., "Ts C27 HO", c("Ts C27 HO", "Tm C27  HO"), "C27Ts/Tm"),
+              #C28BNH29,30/28,30
+                ratio_peaks(., "29, 30 C28 bisnor HO", c("29, 30 C28 bisnor HO", "28, 30 C28 bisnor HO"), "C28BNH29,30/28,30"),
+              #C29Ts/Ts+ab
+                ratio_peaks(., "C29 Ts HO", c( "C29 aB HO", "C29 Ts HO"), "C29Ts/ab"),
+              #C29ba/ba+ab
+                ratio_peaks(.,"C29 Ba HO",  c("C29 aB HO", "C29 Ba HO"), "C29ba/ab"),
+              #C29bb/bb+ab
+                ratio_peaks(., "C29 BB Ho", c("C29 BB Ho", "C29 aB HO"), "C29bb/ab"),
+              #C30_30nor/30nor+ab
+                ratio_peaks(., "30-nor C30H HO", c("C30 aB HO", "30-nor C30H HO"),  "C30_30nor/ab"),
+              #C30ba/ba+ab
+                ratio_peaks(., "C30H Ba HO", c("C30 aB HO", "C30H Ba HO"), "C30ba/ab"),
+              #C30bb/bb+ab
+                ratio_peaks(., "C30 BB HO", c("C30 aB HO", "C30 BB HO"), "C30bb/ab"),
+              #C31S/S+R
+                ratio_peaks(., "C31 aB HS  HO", c("C31 aB HR HO", "C31 aB HS  HO"), "C31S/S+R"),
+              #C32S/S+R
+                ratio_peaks(., "C32 aB HS HO", c("C32 aB HS HO", "C32 aB HR HO"), "C32S/S+R"),
+              #C33S/S+R
+                ratio_peaks(., "C33 aB HS HO", c("C33 aB HS HO", "C33 aB HR HO"), "C33S/S+R"),
+              #C34S/S+R
+                ratio_peaks(., "C34 aB HS HO", c("C34 aB HS HO", "C34 aB HR HO") , "C34S/S+R"),
+              #C35S/S+R
+                ratio_peaks(., "C35 aB HS HO", c("C35 aB HS HO", "C35 aB HR HO") , "C35S/S+R")
+          
+              
+ ) }) %>% ungroup() 
+  
+final_data
+```
+
+```{r}
+ write.table(final_data, file = "Arifinaldata.csv")
+```
+
+
+# Against depth
+
+## ratios etc
+
+###C27Dia/Reg
+```{r "", fig.width = 5, fig.height = 5}
+subset(final_data, peak_name== "C27Dia/Reg") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+
+```{r "", fig.width = 5, fig.height = 5}
+diareg <- subset(final_data, peak_name %in% c("C27Dia", "C27Reg")) %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+ggplotly(diareg)
+```
+```{r}
+# test checks
+outcome <- calib_data %>% 
+  group_by(file_id) %>%
+  select(file_id, peak_name, depth, area.cpm, conc_rock.ug_g) %>% 
+  do({
+    bind_rows(., 
+        ratio_peaks(., "C27 aB 20R ST", "C27 aB 20S ST", "C27Dia_S/R")
+    )
+  }) %>% 
+  filter(#!str_detect(file_id, "TSQ3779"),  
+         str_detect(peak_name, "C27Dia_S/R")) 
+         #str_detect(peak_name, "aB"))
+outcome
+```
+
+###DiaS/S+R
+```{r "diasr", fig.width = 5, fig.height = 5}
+diasr <- final_data %>% 
+  filter(peak_name %in% c("C27Dia_S/R" , "C28DiaS/S+R" , "C29DiaS/S+R")) %>%
+  ggplot() +
+  aes(x = ratio, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+ggplotly(diasr)
+```
+
+```{r "", fig.width = 5, fig.height = 5}
+subset(final_data, peak_name== c("C27 aB 20R ST", "C27 aB 20S ST")) %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+
+###C27Regabb/aaa
+```{r "", fig.width = 5, fig.height = 5}
+subset(final_data, peak_name== "C27Reg_abb/aaa") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+#aaa_S/S+R
+```{r "", fig.width = 5, fig.height = 5}
+final_data %>%
+  filter(peak_name == c("C27Regaaa_S/S+R", "C28aaaS/S+R", "C29aaaS/S+R")) %>%
+  ggplot() +
+  aes(x = ratio, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+###abb_s/s+r
+```{r "", fig.width = 5, fig.height = 5}
+subset(final_data, peak_name == c("C27Regabb_S/S+R", "C28abbS/S+R", "C29abbS/S+R")) %>%
+  ggplot() +
+  aes(x = ratio, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+
+###C28/9Dia/all
+```{r "", fig.width = 5, fig.height = 5}
+Dia <- subset(final_data, peak_name== c("C28Dia/all", "C29Dia/all")) %>%
+  ggplot() +
+  aes(x = ratio, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+ggplotly(Dia)
+```
+
+
+#C28/9abb/all
+```{r "", fig.width = 5, fig.height = 5}
+subset(final_data, peak_name == c("C28abb/all", "C29abb/all"))  %>%
+  ggplot() +
+  aes(x = ratio, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C28aaaS/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C28aaaS/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C28abbS/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C28abbS/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name == c("C28 aBB 20R ST", "C28 aBB 20S ST") ) %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth, color = peak_name) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C29Dia/all
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C29Dia/all") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C29DiaS/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C29DiaS/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name == c("C29 Ba 20R ST", "C29 Ba 20S ST") ) %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth, color = peak_name) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C29abb/all
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C29abb/all") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C29aaaS/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C29aaaS/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C29abbS/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C29abbS/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C27Ts/Tm
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C27Ts/Tm") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+```{r "Tsm", fig.width = 10, fig.height = 8}
+tsm <- subset(final_data, peak_name == c("Ts C27 HO", "Tm C27  HO") ) %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+ggplot(tsm)
+```
+
+#C28BNH29,30/28,30
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C28BNH29,30/28,30") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C29Ts/ab
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C29Ts/ab") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C29,30ba/ab
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== c("C29ba/ab", "C30ba/ab")) %>%
+  ggplot() +
+  aes(x = ratio, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C29bb/ab
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name == c("C29bb/ab", "C30bb/ab")) %>%
+  ggplot() +
+  aes(x = ratio, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C30_30nor/ab
+```{r "", fig.width = 5, fig.height = 5}
+subset(final_data, peak_name== "C30_30nor/ab") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C30ba/ab
+```{r "", fig.width = 5, fig.height = 5}
+subset(final_data, peak_name== "C30ba/ab") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+
+
+```{r "", fig.width = 5, fig.height = 5}
+abba <- final_data %>% 
+  filter(peak_name == c("C30H Ba HO", "C30 aB HO")) %>%
+  group_by(file_id) %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name) +
+  scale_y_reverse()
+ggplotly(abba)
+
+```
+
+```{r "", fig.width = 5, fig.height = 5}
+subset(final_data, peak_name == c("C30 aB HO", "C30H Ba HO")) %>%
+  ggplot() +
+  aes(x = area.cpm, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name) +
+  scale_y_reverse()
+
+```
+
+
+
+
+#C30bb/ab
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C30bb/ab") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#All Ho S/R
+```{r "", fig.width = 5, fig.height = 10}
+srho <- final_data %>%
+  filter(peak_name == c("C31S/S+R", "C32S/S+R", "C33S/S+R", "C34S/S+R", "C35S/S+R")) %>%
+  ggplot() +
+  aes(x = ratio, y = depth, color = peak_name) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") 
+  scale_y_reverse()
+ggplotly(srho)
+```
+
+
+#C31S/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C31S/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C32S/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C32S/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C33S/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C33S/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C34S/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C34S/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+#C35S/S+R
+```{r "", fig.width = 10, fig.height = 8}
+subset(final_data, peak_name== "C35S/S+R") %>%
+  ggplot() +
+  aes(x = ratio, y = depth) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse()
+```
+
+
+
+
+
+
+```{r}
+final_data <- createWorkbook()
+data.frame(final_data)
+#addDataFrame(x=data, sheet=final_data)
+saveWorkbook(final_datas, "Ari_finaldata.xlsx")
+
+```
+
+```{r}
+write.csv(final_data, "final_data.csv")
+```
+
+```{r}
+write.excel <- function(x,row.names=FALSE,col.names=TRUE,...) {
+  write.table(x,"clipboard",sep="\t",row.names=row.names,col.names=col.names,...)
+}
+
+write.excel(final_data)
+```
+
